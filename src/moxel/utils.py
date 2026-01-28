@@ -50,11 +50,12 @@ from ._params import lj_params
 warnings.filterwarnings('ignore')
 
 # Default values for voxels calculation.
-GRID_SIZE = 32
+DENSITY = 1.0         # voxels per Angstrom
+MAX_VOXELS = 262144   # ~1MB limit
 CUTOFF = 10.
 EPSILON = 50.
 SIGMA = 2.5
-CUBIC_BOX = 30
+CUBIC_BOX = None
 N_JOBS = None
 
 
@@ -95,18 +96,17 @@ class Grid:
 
     Parameters
     ----------
-    grid_size : int, default=25
-        Number of grid points along each dimension.
-
-        .. versionchanged:: 0.5.0
-           Now all methods suck!
-
+    density : float, default=1.0
+        Target density in voxels per Angstrom (vox/Å).
+    max_voxels : int, default=262144
+        Maximum number of voxels allowed (~1MB in float32).
+        If grid exceeds this, it is scaled down while maintaining aspect ratio.
     cutoff : float, default=10.0
-        Cutoff radius (Å) for the LJ potential.
+        Cutoff radius (Å) for the LJ potential.
     epsilon : float, default=50.0
         Epsilon value (ε/K) of the probe atom.
     sigma : float, default=2.5
-        Sigma value (σ/Å) of the probe atom.
+        Sigma value (σ/Å) of the probe atom.
 
     Attributes
     ----------
@@ -116,21 +116,26 @@ class Grid:
         Available only after :meth:`Grid.load_structure` has been called.
     cubic_box : float or None
         Available only after :meth:`Grid.calculate` has been called.
-    voxels : array of shape (grid_size,)*3
+    voxels : array of shape (nx, ny, nz)
        Available only after :meth:`Grid.calculate` has been called.
+    grid_dims : tuple of int
+        Grid dimensions (nx, ny, nz) calculated during :meth:`Grid.calculate`.
     """
     def __init__(
             self,
-            grid_size=GRID_SIZE,
             *,
+            density=DENSITY,
+            max_voxels=MAX_VOXELS,
             cutoff=CUTOFF,
             epsilon=EPSILON,
             sigma=SIGMA
             ):
-        self.grid_size = grid_size
+        self.density = density
+        self.max_voxels = max_voxels
         self.cutoff = cutoff
         self.epsilon = epsilon
         self.sigma = sigma
+        self.grid_dims = None
 
     def load_structure(self, pathname):
         r"""
@@ -177,18 +182,63 @@ class Grid:
 
         Returns
         -------
-        voxels : array of shape (grid_size,)*3
+        voxels : array of shape (nx, ny, nz)
         """
         self.cubic_box = cubic_box
 
         if cubic_box is not None:
-            d = cubic_box / 2
-            probe_coords = np.linspace(0 - d, 0 + d, self.grid_size, endpoint=False)  # Cartesian
             self._simulation_box = self.structure
+            box_lengths = np.array([cubic_box, cubic_box, cubic_box])
         else:
-            probe_coords = np.linspace(0, 1, self.grid_size, endpoint=False)  # Fractional
             scale = mic_scale_factors(self.cutoff, self.structure.lattice.matrix)
             self._simulation_box = self.structure * scale
+            box_lengths = np.array(self._simulation_box.lattice.abc)
+
+        # Compute grid dimensions from density
+        dims = np.ceil(box_lengths * self.density).astype(int)
+        total_points = np.prod(dims)
+
+        # Downscale if necessary while preserving aspect ratio
+        if total_points > self.max_voxels:
+            original_dims = dims.copy()
+
+            # Calculate scaling factor to reduce volume to max_voxels while maintaining the aspect ratio.
+            vol_scale = (self.max_voxels / total_points) ** (1/3)
+
+            # Apply scale and ensure at least 1 grid point per axis
+            dims = np.ceil(original_dims * vol_scale).astype(int)
+            dims = np.maximum(dims, 1)
+ 
+            max_iterations = 100
+            iteration = 0
+            
+            while np.prod(dims) > self.max_voxels:
+                vol_scale *= 0.99
+                dims = np.ceil(original_dims * vol_scale).astype(int)
+                dims = np.maximum(dims, 1)
+                iteration += 1
+                
+            if iteration > 10:  # Should be rare with safety margin
+                print(f"Warning: {iteration} iterations for {original_dims} -> {dims}")
+    
+            if iteration >= max_iterations:
+                print(f"ERROR: Failed to downsample {original_dims} after {max_iterations} iterations")
+
+            # Recalculate total for logging/verification if needed
+            total_points = np.prod(dims)
+            
+        self.grid_dims = tuple(dims)
+        nx, ny, nz = self.grid_dims
+
+        if cubic_box is not None:
+            d = cubic_box / 2
+            coords_x = np.linspace(0 - d, 0 + d, nx, endpoint=False)
+            coords_y = np.linspace(0 - d, 0 + d, ny, endpoint=False)
+            coords_z = np.linspace(0 - d, 0 + d, nz, endpoint=False)
+        else:
+            coords_x = np.linspace(0, 1, nx, endpoint=False)
+            coords_y = np.linspace(0, 1, ny, endpoint=False)
+            coords_z = np.linspace(0, 1, nz, endpoint=False)
 
         if potential == 'lj':
             # Cache LJ parameters for all atoms in the simulation box.
@@ -202,10 +252,10 @@ class Grid:
             # Embarrassingly parallel.
             with Pool(processes=n_jobs) as p:
                 energies = p.map(
-                        self.lj_potential, itertools.product(*(probe_coords,)*3)
+                        self.lj_potential, itertools.product(coords_x, coords_y, coords_z)
                         )
 
-        self.voxels = np.array(energies, dtype=np.float32).reshape((self.grid_size,)*3)
+        self.voxels = np.array(energies, dtype=np.float32).reshape(self.grid_dims)
 
         return self.voxels
 
@@ -251,7 +301,8 @@ class Grid:
 
 def voxels_from_file(
         cif_pathname,
-        grid_size=GRID_SIZE,
+        density=DENSITY,
+        max_voxels=MAX_VOXELS,
         *,
         cutoff=CUTOFF,
         epsilon=EPSILON,
@@ -267,6 +318,10 @@ def voxels_from_file(
     ----------
     cif_pathname : str
        Pathname to the ``.cif`` file.
+    density : float
+        Target density in voxels per Angstrom (vox/Å).
+    max_voxels : int
+        Maximum allowed voxels.
     only_voxels : bool, default=True
         Determines ``out`` type.
         
@@ -280,7 +335,7 @@ def voxels_from_file(
     :func:`voxels_from_dir`
         For a description of the parameters.
     """
-    grid = Grid(grid_size, cutoff=cutoff, epsilon=epsilon, sigma=sigma)
+    grid = Grid(density=density, max_voxels=max_voxels, cutoff=cutoff, epsilon=epsilon, sigma=sigma)
 
     grid.load_structure(cif_pathname)
     grid.calculate(cubic_box=cubic_box, n_jobs=n_jobs)
@@ -294,7 +349,8 @@ def voxels_from_file(
 def voxels_from_files(
         cif_pathnames,
         out_pathname,
-        grid_size=GRID_SIZE,
+        density=DENSITY,
+        max_voxels=MAX_VOXELS,
         *,
         cutoff=CUTOFF,
         epsilon=EPSILON,
@@ -313,6 +369,10 @@ def voxels_from_files(
        List of pathnames to the ``.cif`` files.
     out_pathname : str
         Pathname to the directory under which voxels are stored.
+    density : float
+        Target density in voxels per Angstrom (vox/Å).
+    max_voxels : int
+        Maximum allowed voxels.
 
     See Also
     --------
@@ -323,14 +383,15 @@ def voxels_from_files(
     -----
     Structures that can't be processsed are omitted.
     """
-    os.mkdir(out_pathname)
+    os.makedirs(out_pathname, exist_ok=True)
 
     for file in tqdm(cif_pathnames, desc='Creating energy voxels'):
         try:
             name = Path(file).stem  # Name of the structure.
             grid = voxels_from_file(
                     cif_pathname=file,
-                    grid_size=grid_size,
+                    density=density,
+                    max_voxels=max_voxels,
                     cutoff=cutoff,
                     epsilon=epsilon,
                     sigma=sigma,
@@ -347,7 +408,8 @@ def voxels_from_files(
 def voxels_from_dir(
         cif_dirname: str,
         out_pathname: str,
-        grid_size: int = GRID_SIZE,
+        density: float = DENSITY,
+        max_voxels: int = MAX_VOXELS,
         *,
         cutoff: float = CUTOFF,
         epsilon: float = EPSILON,
@@ -366,14 +428,16 @@ def voxels_from_dir(
        Pathname to the directory containing the ``.cif`` files.
     out_pathname : str
         Pathname of an existing directory under which voxels are stored.
-    grid_size : int, default=25
-        Number of grid points along each dimension.
+    density : float
+        Target density in voxels per Angstrom (vox/Å).
+    max_voxels : int
+        Maximum allowed voxels.
     cutoff : float, default=10.0
-        Cutoff radius (Å) for the LJ potential.
+        Cutoff radius (Å) for the LJ potential.
     epsilon : float, default=50.0
         Epsilon value (ε/K) of the probe atom.
     sigma : float, default=2.5
-        Sigma value (σ/Å) of the probe atom.
+        Sigma value (σ/Å) of the probe atom.
     cubic_box : float or None, default=None
         If ``None``, the simulation box is a supercell scaled according to
         MIC. Otherwise, cubic box of size ``cubic_box``.
@@ -385,11 +449,12 @@ def voxels_from_dir(
     -----
     Structures that can't be processsed are omitted.
     """
-    cif_pathanmes = [os.path.join(cif_dirname, f) for f in os.listdir(cif_dirname)]
+    cif_pathnames = [os.path.join(cif_dirname, f) for f in os.listdir(cif_dirname) if f.endswith('.cif')]
 
     voxels_from_files(
-            cif_pathanmes, out_pathname,
-            grid_size=grid_size,
+            cif_pathnames, out_pathname,
+            density=density,
+            max_voxels=max_voxels,
             cutoff=cutoff,
             epsilon=epsilon,
             sigma=sigma,
